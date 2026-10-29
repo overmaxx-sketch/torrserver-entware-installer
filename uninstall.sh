@@ -1,48 +1,28 @@
 #!/bin/sh
 
-PIDFILE=/opt/var/run/torrserver.pid
-WDPID=/opt/var/run/torrserver-watchdog.pid
+INSTALL_DIR="/opt/sbin"
+INIT_PATH="/opt/etc/init.d/torrserver.init"
+BIN_PATH="$INSTALL_DIR/torrserver"
+CONFIG_DIR="/opt/etc/torrserver"
 
-echo "=================================="
-echo "TorrServer Uninstaller"
-echo "=================================="
+echo "=== Удаление TorrServer ==="
 
-echo "Stopping service..."
-
-if [ -x /opt/etc/init.d/S99TorrServer ]; then
-    /opt/etc/init.d/S99TorrServer stop 2>/dev/null || true
+# Остановка службы через init-скрипт, если он существует
+if [ -x "$INIT_PATH" ]; then
+    echo "Остановка службы..."
+    "$INIT_PATH" stop
 fi
 
-# watchdog
-if [ -f "$WDPID" ]; then
-    kill "$(cat "$WDPID" 2>/dev/null)" 2>/dev/null || true
-    rm -f "$WDPID"
-fi
+# Удаление файлов службы и бинарника
+echo "Удаление файлов приложения..."
+rm -f "$INIT_PATH"
+rm -f "$BIN_PATH"
+rm -f "/opt/var/run/torrserver.pid"
+rm -f "/opt/var/run/torrserver-watchdog.pid"
+rm -f "/opt/var/log/torrserver.log"
+rm -f "/opt/var/log/torrserver.log.old"
 
-# torrserver
-if [ -f "$PIDFILE" ]; then
-    kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null || true
-    rm -f "$PIDFILE"
-fi
+# Раскомментируйте строчку ниже, если хотите полностью удалить настройки и базу данных TorrServer:
+# rm -rf "$CONFIG_DIR"
 
-sleep 2
-
-# emergency cleanup
-killall torrserver 2>/dev/null || true
-
-rm -f /opt/etc/init.d/S99TorrServer
-rm -f /opt/sbin/torrserver
-
-echo
-echo "TorrServer removed."
-
-echo
-echo "Preserved:"
-echo "  /opt/etc/torrserver"
-echo "  /opt/var/log/torrserver.log"
-echo "  /opt/var/log/torrserver.log.old"
-
-echo
-echo "If you want full cleanup, remove manually:"
-echo "rm -rf /opt/etc/torrserver"
-echo "rm -f /opt/var/log/torrserver.log*"
+echo "=== Удаление успешно завершено ==="
