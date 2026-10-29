@@ -30,3 +30,29 @@ Installation
 Run:
 
 curl -fsSL https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/install.sh | sh
+
+or
+
+wget -qO- https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/install.sh | sh
+
+Service Management
+Status:
+/opt/etc/init.d/S99TorrServer status
+
+Start:
+/opt/etc/init.d/S99TorrServer start
+
+Stop:
+/opt/etc/init.d/S99TorrServer stop
+
+Restart:
+/opt/etc/init.d/S99TorrServer restart
+
+Uninstall
+curl -fsSL https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/uninstall.sh | sh
+
+Source Project
+https://github.com/overmaxx-sketch/torrserver-bylampa-unlock
+
+Disclaimer
+This project is not affiliated with the official TorrServer project. It only provides automated installation of releases built from a personal fork.
