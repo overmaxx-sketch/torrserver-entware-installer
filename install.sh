@@ -6,6 +6,13 @@ REPO="overmaxx-sketch/torrserver-bylampa-unlock"
 
 echo "Installing TorrServer Bylampa Unlock..."
 
+for CMD in curl grep awk; do
+    command -v $CMD >/dev/null || {
+        echo "$CMD not found"
+        exit 1
+    }
+done
+
 mkdir -p /opt/sbin
 mkdir -p /opt/etc/init.d
 mkdir -p /opt/etc/torrserver
