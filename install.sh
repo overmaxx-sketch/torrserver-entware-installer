@@ -21,16 +21,16 @@ ARCH="$(uname -m)"
 
 case "$ARCH" in
     aarch64)
-        ASSET="linux_arm64"
+        ASSET="linux-arm64"
         ;;
     armv7l)
-        ASSET="linux_arm7"
+        ASSET="linux-arm7"
         ;;
     arm*)
-        ASSET="linux_arm5"
+        ASSET="linux-arm5"
         ;;
     x86_64)
-        ASSET="linux_amd64"
+        ASSET="linux-amd64"
         ;;
     *)
         echo "Unsupported CPU: $ARCH"
