@@ -1,4 +1,3 @@
-```sh
 #!/bin/sh
 # TorrServer Unblock byLampa uninstaller / rollback
 # ASUSWRT-Merlin / Entware
@@ -267,4 +266,3 @@ case "$choice" in
 esac
 
 exit $?
-```
