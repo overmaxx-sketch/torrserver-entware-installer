@@ -1149,32 +1149,24 @@ fi
 sync
 
 ###############################################
-# Restore original running/stopped state
+# Start and verify service after installation
 ###############################################
 
-if [ "$WAS_RUNNING" -eq 1 ] || [ "$HAD_OLD_BIN" -eq 0 ] || [ "$HAD_OLD_INIT" -eq 0 ]; then
-    if [ "$WAS_RUNNING" -eq 1 ]; then
-        log "Service was running before update; starting updated service"
-    else
-        log "Fresh/incomplete installation detected; starting TorrServer"
-    fi
+log "Starting TorrServer after installation"
 
-    if ! start_service; then
-        log "ERROR: Updated service failed to start"
-        rollback
-        exit 1
-    fi
-
-    if ! verify_service_ready; then
-        log "ERROR: Post-install service health checks failed"
-        rollback
-        exit 1
-    fi
-
-    log "TorrServer, watchdog and HTTP readiness checks passed"
-else
-    log "Existing installation was stopped before update; leaving it stopped"
+if ! start_service; then
+    log "ERROR: Updated service failed to start"
+    rollback
+    exit 1
 fi
+
+if ! verify_service_ready; then
+    log "ERROR: Post-install service health checks failed"
+    rollback
+    exit 1
+fi
+
+log "TorrServer, watchdog and HTTP readiness checks passed"
 
 INSTALL_STARTED=0
 log "Update completed successfully: $TARGET_TAG"
