@@ -64,6 +64,8 @@ INSTALL_STARTED=0
 ROLLBACK_IN_PROGRESS=0
 HAD_OLD_BIN=0
 HAD_OLD_INIT=0
+SETTINGS_EXISTED=0
+SETTINGS_CHANGED=0
 
 log() {
     MSG="$(date '+%Y-%m-%d %H:%M:%S') $*"
@@ -134,8 +136,13 @@ watchdog_running() {
     kill -0 "$PID" 2>/dev/null || return 1
     [ -r "/proc/$PID/cmdline" ] || return 1
 
-    # The watchdog is the shell running its embedded restart loop.
-    tr '\000' ' ' < "/proc/$PID/cmdline" 2>/dev/null | grep -q 'RESTARTS=0'
+    # Match the watchdog launched by the current init script.
+    # The old RESTARTS=0 signature no longer exists in watchdog-loop mode.
+    CMDLINE="$(tr '\000' ' ' < "/proc/$PID/cmdline" 2>/dev/null)"
+    case "$CMDLINE" in
+        *"/opt/etc/init.d/S90torrserver"*'watchdog-loop'*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 start_service() {
@@ -456,6 +463,21 @@ rollback() {
         log "ROLLBACK: removed newly installed init script (no previous init script existed)"
     fi
 
+    # Restore settings.json if this installation attempt changed it.
+    if [ "$SETTINGS_CHANGED" -eq 1 ]; then
+        if [ "$SETTINGS_EXISTED" -eq 1 ]; then
+            if [ -f "$WORKDIR/settings.original" ] &&
+               cp -p "$WORKDIR/settings.original" "$SETTINGS"; then
+                log "ROLLBACK: original settings.json restored"
+            else
+                log "CRITICAL: could not restore original settings.json"
+            fi
+        else
+            rm -f "$SETTINGS"
+            log "ROLLBACK: removed settings.json created by this attempt"
+        fi
+    fi
+
     sync
 
     # Restore the service's original running/stopped state.
@@ -549,16 +571,28 @@ rotate_log() {
 }
 
 valid_pid() {
+    # Validate the TorrServer process only; never accept a shell merely because
+    # its command line contains a watchdog counter.
     case "$1" in
         ''|*[!0-9]*) return 1 ;;
     esac
 
     kill -0 "$1" 2>/dev/null || return 1
     [ -r "/proc/$1/cmdline" ] || return 1
+    tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null |
+        grep -q '/opt/sbin/torrserver'
+}
 
+valid_watchdog_pid() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -r "/proc/$1/cmdline" ] || return 1
     CMDLINE="$(tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null)"
     case "$CMDLINE" in
-        *"/opt/sbin/torrserver"*|*"RESTARTS=0"*) return 0 ;;
+        *"/opt/etc/init.d/S90torrserver"*'watchdog-loop'*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -662,52 +696,14 @@ start() {
         echo "TorrServer is running (pid $(cat "$PIDFILE"))"
     fi
 
-    if [ ! -f "$WDPID" ] || ! valid_pid "$(cat "$WDPID" 2>/dev/null)"; then
+    if [ ! -f "$WDPID" ] || ! valid_watchdog_pid "$(cat "$WDPID" 2>/dev/null)"; then
         rm -f "$WDPID"
 
-        # Launch watchdog using start-stop-daemon, just like the old script.
+        # Run the watchdog through this init script so it uses the same
+        # validated watchdog_loop() implementation as the service manager.
         start-stop-daemon -S -b -m \
             -p "$WDPID" \
-            -x /bin/sh -- -c "
-                log_msg() { echo \"\$(date '+%Y-%m-%d %H:%M:%S') - \$*\" >> \"$LOGFILE\"; }
-                RESTARTS=0
-                STABLE_TIME=0
-                while :; do
-                    sleep 10
-                    [ -f \"$WDPID\" ] || exit 0
-                    PID=\$(cat \"$PIDFILE\" 2>/dev/null)
-
-                    if [ -z \"\$PID\" ] || ! kill -0 \"\$PID\" 2>/dev/null; then
-                        log_msg \"CRASH: Process died (restart \$RESTARTS/10)\"
-                        rm -f \"$PIDFILE\"
-                        RESTARTS=\$((RESTARTS + 1))
-                        STABLE_TIME=0
-
-                        if [ \"\$RESTARTS\" -gt 10 ]; then
-                            log_msg \"ERROR: Restart limit reached. Giving up.\"
-                            rm -f \"$WDPID\"
-                            exit 1
-                        fi
-
-                        if [ -f \"$LOGFILE\" ] && [ \"\$(wc -c < $LOGFILE)\" -gt 524288 ]; then
-                            mv "$LOGFILE" "$LOGFILE.old"
-                        fi
-
-                        start-stop-daemon -S -b -m \\
-                            -p \"$PIDFILE\" \\
-                            -x /bin/sh -- -c \"export GOMAXPROCS=1; export GOGC=20; exec $BIN -d $TS_DIR -p 8090 >> $LOGFILE 2>&1\"
-                    else
-                        if [ \"\$RESTARTS\" -gt 0 ]; then
-                            STABLE_TIME=\$((STABLE_TIME + 10))
-                            if [ \"\$STABLE_TIME\" -ge 300 ]; then
-                                RESTARTS=0
-                                STABLE_TIME=0
-                                log_msg \"INFO: Process stable for 5min; restart counter reset\"
-                            fi
-                        fi
-                    fi
-                done
-            " || {
+            -x "$0" -- watchdog-loop || {
                 log_msg "ERROR: start-stop-daemon could not launch watchdog"
                 rm -f "$WDPID"
                 return 1
@@ -723,7 +719,7 @@ stop() {
 
     WPID="$(cat "$WDPID" 2>/dev/null)"
 
-    if valid_pid "$WPID"; then
+    if valid_watchdog_pid "$WPID"; then
         # Remove the PID file first; this is the watchdog's stop signal.
         rm -f "$WDPID"
         kill "$WPID" 2>/dev/null
@@ -732,12 +728,12 @@ stop() {
     fi
 
     n=0
-    while valid_pid "$WPID" && [ "$n" -lt 5 ]; do
+    while valid_watchdog_pid "$WPID" && [ "$n" -lt 5 ]; do
         sleep 1
         n=$((n + 1))
     done
 
-    if valid_pid "$WPID"; then
+    if valid_watchdog_pid "$WPID"; then
         log_msg "WARNING: Watchdog did not stop after TERM; sending KILL"
         kill -KILL "$WPID" 2>/dev/null
     fi
@@ -780,7 +776,7 @@ status() {
 
     WPID="$(cat "$WDPID" 2>/dev/null)"
 
-    if valid_pid "$WPID"; then
+    if valid_watchdog_pid "$WPID"; then
         echo "Watchdog is running (pid $WPID)"
     else
         echo "Watchdog is stopped"
@@ -792,6 +788,7 @@ case "$1" in
     stop) stop ;;
     restart) restart ;;
     status) status ;;
+    watchdog-loop) watchdog_loop ;;
     *)
         echo "Usage: $0 {start|stop|restart|status}"
         exit 1
@@ -1108,11 +1105,6 @@ if ! create_init_script; then
     exit 1
 fi
 
-# Configure DNS only after the downloaded binary has passed validation.
-if ! ensure_dns; then
-    exit 1
-fi
-
 ###############################################
 # Back up existing files
 ###############################################
@@ -1146,6 +1138,23 @@ fi
 ###############################################
 
 INSTALL_STARTED=1
+
+# Snapshot the exact pre-update settings before ensure_dns can modify them.
+if [ -f "$SETTINGS" ]; then
+    SETTINGS_EXISTED=1
+    if ! cp -p "$SETTINGS" "$WORKDIR/settings.original"; then
+        log "ERROR: Cannot snapshot settings.json; refusing to modify it"
+        rollback
+        exit 1
+    fi
+fi
+
+log "Checking DNS settings"
+SETTINGS_CHANGED=1
+if ! ensure_dns; then
+    rollback
+    exit 1
+fi
 
 log "Stopping TorrServer before replacing files"
 
