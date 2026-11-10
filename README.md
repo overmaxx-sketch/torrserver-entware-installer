@@ -314,8 +314,7 @@ Connect to the device via SSH.
 ### 1. Run the installer
 
 ```sh
-wget -O /tmp/torrserver-install.sh https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/install.sh && sh /tmp/torrserver-i
-nstall.sh
+wget -O /tmp/torrserver-install.sh https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/install.sh && sh /tmp/torrserver-install.sh
 ```
 Follow the on-screen instructions and select the desired release.
 
@@ -328,8 +327,7 @@ The same installer is intended for fresh installations and updates.
 Download the current installer and run it again:
 
 ```sh
-wget -O /tmp/torrserver-install.sh https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/install.sh && sh /tmp/torrserver-i
-nstall.sh
+wget -O /tmp/torrserver-install.sh https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/install.sh && sh /tmp/torrserver-install.sh
 ```
 
 Select the required release from the available menu.
