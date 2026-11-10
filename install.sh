@@ -59,6 +59,7 @@ INIT_CANDIDATE="$WORKDIR/S90torrserver.new"
 TMP_JSON="$WORKDIR/releases.json"
 
 WAS_RUNNING=0
+HAD_COMPLETE_INSTALL=0
 INSTALL_STARTED=0
 ROLLBACK_IN_PROGRESS=0
 HAD_OLD_BIN=0
@@ -74,7 +75,7 @@ check_dependencies() {
     REQUIRED_TOOLS="
         wget grep cut head sed df tail awk
         cp chmod mkdir rm rmdir cat date sleep
-        kill mv wc sync env sh
+        kill mv wc sync env sh which start-stop-daemon tr
     "
 
     MISSING_TOOLS=""
@@ -115,7 +116,11 @@ service_running() {
         ''|*[!0-9]*) return 1 ;;
     esac
 
-    kill -0 "$PID" 2>/dev/null
+    kill -0 "$PID" 2>/dev/null || return 1
+    [ -r "/proc/$PID/cmdline" ] || return 1
+
+    # A live but unrelated process must not be mistaken for TorrServer.
+    tr '\000' ' ' < "/proc/$PID/cmdline" 2>/dev/null | grep -q '/opt/sbin/torrserver'
 }
 
 watchdog_running() {
@@ -126,7 +131,11 @@ watchdog_running() {
         ''|*[!0-9]*) return 1 ;;
     esac
 
-    kill -0 "$PID" 2>/dev/null
+    kill -0 "$PID" 2>/dev/null || return 1
+    [ -r "/proc/$PID/cmdline" ] || return 1
+
+    # The watchdog is the shell running its embedded restart loop.
+    tr '\000' ' ' < "/proc/$PID/cmdline" 2>/dev/null | grep -q 'RESTARTS=0'
 }
 
 start_service() {
@@ -254,13 +263,14 @@ verify_service_ready() {
 ensure_dns() {
     # Fresh installation: create a minimal settings file if none exists.
     if [ ! -f "$SETTINGS" ]; then
-        log "settings.json does not exist; creating initial configuration"
-        if ! printf '{\n  "Dns": "127.0.0.1"\n}\n' > "$SETTINGS"; then
-            log "ERROR: Could not create settings.json: $SETTINGS"
-            return 1
+        log "settings.json does not exist; no backup is needed"
+        log "Attempting to create an initial configuration"
+        if ! printf '{\n  "Dns": "127.0.0.1",\n  "BitTorr": {\n    "StoreSettingsInJson": true\n  }\n}\n' > "$SETTINGS"; then
+            log "WARNING: Could not create settings.json: $SETTINGS; continuing installation without it"
+            return 0
         fi
         chmod 644 "$SETTINGS" 2>/dev/null || true
-        log "Initial settings.json created with Dns=127.0.0.1"
+        log "Initial settings.json created with Dns=127.0.0.1 and BitTorr.StoreSettingsInJson=true"
         return 0
     fi
 
@@ -272,8 +282,9 @@ ensure_dns() {
         if cp -p "$SETTINGS" "$DNS_BACKUP"; then
             log "Settings backup saved: $DNS_BACKUP"
         else
-            # A backup is useful, but its failure should not block installation.
-            log "WARNING: Could not back up settings.json; continuing without a new backup"
+            # Do not modify user settings unless a recoverable backup exists.
+            log "ERROR: Could not back up settings.json; refusing to change it"
+            return 1
         fi
     else
         log "Settings backup already exists; leaving it unchanged"
@@ -542,7 +553,14 @@ valid_pid() {
         ''|*[!0-9]*) return 1 ;;
     esac
 
-    kill -0 "$1" 2>/dev/null
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -r "/proc/$1/cmdline" ] || return 1
+
+    CMDLINE="$(tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null)"
+    case "$CMDLINE" in
+        *"/opt/sbin/torrserver"*|*"RESTARTS=0"*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 get_uptime() {
@@ -651,6 +669,7 @@ start() {
         start-stop-daemon -S -b -m \
             -p "$WDPID" \
             -x /bin/sh -- -c "
+                log_msg() { echo \"\$(date '+%Y-%m-%d %H:%M:%S') - \$*\" >> \"$LOGFILE\"; }
                 RESTARTS=0
                 STABLE_TIME=0
                 while :; do
@@ -670,7 +689,7 @@ start() {
                             exit 1
                         fi
 
-                        if [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE")" -gt 524288 ]; then
+                        if [ -f \"$LOGFILE\" ] && [ \"\$(wc -c < $LOGFILE)\" -gt 524288 ]; then
                             mv "$LOGFILE" "$LOGFILE.old"
                         fi
 
@@ -830,6 +849,12 @@ fi
 
 if service_running; then
     WAS_RUNNING=1
+fi
+
+# Preserve the stopped state for an already complete installation.
+# Fresh or incomplete installations are started after installation.
+if [ -x "$TS_BIN" ] && [ -x "$INIT" ]; then
+    HAD_COMPLETE_INSTALL=1
 fi
 
 CURRENT_TAG="$(get_current_version)"
@@ -1173,10 +1198,10 @@ fi
 sync
 
 ###############################################
-# Start and verify service after installation
+# Start TorrServer after every successful installation/update
 ###############################################
 
-log "Starting TorrServer after installation"
+log "Starting TorrServer after installation/update, regardless of its previous state"
 
 if ! start_service; then
     log "ERROR: Updated service failed to start"
