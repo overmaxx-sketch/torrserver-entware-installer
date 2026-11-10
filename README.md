@@ -334,6 +334,14 @@ Select the required release from the available menu.
 
 The installer attempts to preserve the existing installation and service state. Keep backups until the new version has been verified.
 
+## Uninstall Torrserver
+
+```sh
+wget -O /tmp/torrserver-uninstall.sh \
+  https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/uninstall.sh \
+  && sh /tmp/torrserver-uninstall.sh
+```
+
 ## File locations
 
 | Purpose | Path |
