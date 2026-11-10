@@ -311,34 +311,15 @@ Before using the installer, make sure that:
 
 Connect to the device via SSH.
 
-### 1. Download the installer
+### 1. Run the installer
 
 ```sh
-wget -O /tmp/torrserver-install.sh \
-  https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/install.sh
+wget -O /tmp/torrserver-install.sh https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/install.sh && sh /tmp/torrserver-i
+nstall.sh
 ```
-
-### 2. Review the script
-
-```sh
-less /tmp/torrserver-install.sh
-```
-
-### 3. Check shell syntax
-
-```sh
-sh -n /tmp/torrserver-install.sh
-```
-
-### 4. Run the installer
-
-```sh
-sh /tmp/torrserver-install.sh
-```
-
 Follow the on-screen instructions and select the desired release.
 
-> **Security notice:** The installer downloads and replaces executable files, modifies configuration, and manages service processes. Review the script before running it.
+> **Security notice:** The installer downloads and replaces executable files, modifies configuration, and manages service processes.
 
 ## Updating or changing versions
 
@@ -347,10 +328,8 @@ The same installer is intended for fresh installations and updates.
 Download the current installer and run it again:
 
 ```sh
-wget -O /tmp/torrserver-install.sh \
-  https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/install.sh
-
-sh /tmp/torrserver-install.sh
+wget -O /tmp/torrserver-install.sh https://raw.githubusercontent.com/overmaxx-sketch/torrserver-entware-installer/main/install.sh && sh /tmp/torrserver-i
+nstall.sh
 ```
 
 Select the required release from the available menu.
