@@ -284,20 +284,24 @@ ensure_dns() {
         return 0
     fi
 
-    if grep -Eq '"Dns"[[:space:]]*:[[:space:]]*"127\.0\.0\.1"' "$SETTINGS"; then
-        log "DNS is already set to 127.0.0.1"
-        return 0
-    fi
-
+    # Back up an existing configuration before any DNS checks or changes.
+    # Keep the first backup intact on subsequent installer runs.
     DNS_BACKUP="$SETTINGS.before-dns"
 
     if [ ! -f "$DNS_BACKUP" ]; then
-        if ! cp -p "$SETTINGS" "$DNS_BACKUP"; then
-            log "ERROR: Could not back up settings.json"
-            return 1
+        if cp -p "$SETTINGS" "$DNS_BACKUP"; then
+            log "Settings backup saved: $DNS_BACKUP"
+        else
+            # A backup is useful, but its failure should not block installation.
+            log "WARNING: Could not back up settings.json; continuing without a new backup"
         fi
+    else
+        log "Settings backup already exists; leaving it unchanged"
+    fi
 
-        log "Settings backup saved: $DNS_BACKUP"
+    if grep -Eq '"Dns"[[:space:]]*:[[:space:]]*"127\.0\.0\.1"' "$SETTINGS"; then
+        log "DNS is already set to 127.0.0.1"
+        return 0
     fi
 
     TMP_SETTINGS="$WORKDIR/settings.json"
@@ -927,7 +931,7 @@ esac
 BIN_URL="https://github.com/$REPO/releases/download/$TARGET_TAG/$TARGET"
 log "Downloading $TARGET_TAG to temporary storage"
 
-if ! wget --no-hsts --timeout=30 --tries=2 -q -O "$CANDIDATE" "$BIN_URL"; then
+if ! wget --no-hsts --timeout=30 --tries=2 -O "$CANDIDATE" "$BIN_URL"; then
     log "ERROR: Download failed"
     exit 1
 fi
