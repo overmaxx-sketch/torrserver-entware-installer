@@ -15,9 +15,11 @@ LOGDIR="/opt/var/log"
 LOGFILE="$LOGDIR/torrserver.log"
 UPDATELOG="$LOGDIR/torrserver-update.log"
 
-RUNDIR="/opt/var/run"
+RUNDIR="/tmp/torrserver/run"
 PIDFILE="$RUNDIR/torrserver.pid"
 WDPID="$RUNDIR/torrserver-watchdog.pid"
+LEGACY_PIDFILE="/opt/var/run/torrserver.pid"
+LEGACY_WDPID="/opt/var/run/torrserver-watchdog.pid"
 
 BIN_BACKUP="$TS_DIR/torrserver.backup"
 INIT_BACKUP="$INIT.backup"
@@ -108,6 +110,16 @@ stop_service() {
             fi
         fi
 
+        # Also check PID files from older installations.
+        for FILE in "$LEGACY_PIDFILE" "$LEGACY_WDPID"; do
+            if [ -f "$FILE" ]; then
+                PID="$(cat "$FILE" 2>/dev/null)"
+                if valid_pid "$PID" && kill -0 "$PID" 2>/dev/null; then
+                    alive=1
+                fi
+            fi
+        done
+
         [ "$alive" -eq 0 ] && break
 
         sleep 1
@@ -132,7 +144,18 @@ stop_service() {
         fi
     fi
 
-    rm -f "$PIDFILE" "$WDPID"
+    for FILE in "$LEGACY_PIDFILE" "$LEGACY_WDPID"; do
+        if [ -f "$FILE" ]; then
+            PID="$(cat "$FILE" 2>/dev/null)"
+            if valid_pid "$PID" && kill -0 "$PID" 2>/dev/null; then
+                log "ERROR: A TorrServer-related process may still be running (PID $PID, file $FILE)."
+                log "Refusing to remove files while the process is running."
+                return 1
+            fi
+        fi
+    done
+
+    rm -f "$PIDFILE" "$WDPID" "$LEGACY_PIDFILE" "$LEGACY_WDPID"
     log "Service stop check completed."
     return 0
 }
@@ -212,7 +235,7 @@ full_uninstall() {
     rm -f "$TS_BIN" || return 1
     rm -f "$INIT" || return 1
     rm -f "$BIN_BACKUP" "$INIT_BACKUP"
-    rm -f "$PIDFILE" "$WDPID"
+    rm -f "$PIDFILE" "$WDPID" "$LEGACY_PIDFILE" "$LEGACY_WDPID"
 
     # Remove the configuration directory only if it is empty.
     rmdir "$TS_DIR" 2>/dev/null
