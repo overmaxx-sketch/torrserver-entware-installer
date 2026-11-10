@@ -14,36 +14,16 @@ detect_architecture() {
     MACHINE="$(uname -m 2>/dev/null)"
 
     case "$MACHINE" in
-        aarch64|arm64)
-            ARCH="arm64"
-            ;;
-        armv7l|armv7|armhf)
-            ARCH="arm7"
-            ;;
-        armv6l|armv6)
-            ARCH="arm6"
-            ;;
-        armv5tel|armv5l|armv5)
-            ARCH="arm5"
-            ;;
-        x86_64|amd64)
-            ARCH="amd64"
-            ;;
-        i386|i486|i586|i686|x86)
-            ARCH="386"
-            ;;
-        mips)
-            ARCH="mips"
-            ;;
-        mipsel|mipsle)
-            ARCH="mipsle"
-            ;;
-        mips64)
-            ARCH="mips64"
-            ;;
-        mips64el|mips64le)
-            ARCH="mips64le"
-            ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        armv7l|armv7|armhf) ARCH="arm7" ;;
+        armv6l|armv6) ARCH="arm6" ;;
+        armv5tel|armv5l|armv5) ARCH="arm5" ;;
+        x86_64|amd64) ARCH="amd64" ;;
+        i386|i486|i586|i686|x86) ARCH="386" ;;
+        mips) ARCH="mips" ;;
+        mipsel|mipsle) ARCH="mipsle" ;;
+        mips64) ARCH="mips64" ;;
+        mips64el|mips64le) ARCH="mips64le" ;;
         *)
             log "ERROR: Unsupported architecture: $MACHINE"
             return 1
@@ -588,6 +568,52 @@ get_uptime() {
     fi
 }
 
+watchdog_loop() {
+    RESTARTS=0
+    STABLE_TIME=0
+
+    while :; do
+        sleep 10
+
+        # Removing the watchdog PID file is the stop request.
+        [ -f "$WDPID" ] || exit 0
+
+        PID="$(cat "$PIDFILE" 2>/dev/null)"
+
+        if ! valid_pid "$PID"; then
+            rm -f "$PIDFILE"
+            RESTARTS=$((RESTARTS + 1))
+            STABLE_TIME=0
+
+            log_msg "CRASH: Process died (restart $RESTARTS/10)"
+
+            if [ "$RESTARTS" -gt 10 ]; then
+                log_msg "ERROR: Restart limit reached. Giving up."
+                rm -f "$WDPID"
+                exit 1
+            fi
+
+            rotate_log
+
+            start-stop-daemon -S -b -m -p "$PIDFILE" \
+                -x /bin/sh -- -c "export GOMAXPROCS=1; export GOGC=20; exec \"$BIN\" -d \"$TS_DIR\" -p 8090 >> \"$LOGFILE\" 2>&1" || {
+                    log_msg "ERROR: Watchdog could not restart TorrServer"
+                    rm -f "$PIDFILE"
+                }
+        else
+            if [ "$RESTARTS" -gt 0 ]; then
+                STABLE_TIME=$((STABLE_TIME + 10))
+
+                if [ "$STABLE_TIME" -ge 300 ]; then
+                    RESTARTS=0
+                    STABLE_TIME=0
+                    log_msg "INFO: Process stable for 5min; restart counter reset"
+                fi
+            fi
+        fi
+    done
+}
+
 start() {
     mkdir -p "$LOGDIR" "$RUNDIR" "$TS_DIR" || return 1
 
@@ -598,13 +624,15 @@ start() {
         rotate_log
         log_msg "INFO: Starting TorrServer"
 
-        (
-            export GOMAXPROCS=1
-            export GOGC=20
-            exec "$BIN" -d "$TS_DIR" -p 8090
-        ) >> "$LOGFILE" 2>&1 &
+        # Use the same daemonization mechanism as the old working init script.
+        start-stop-daemon -S -b -m \
+            -p "$PIDFILE" \
+            -x /bin/sh -- -c "export GOMAXPROCS=1; export GOGC=20; exec $BIN -d $TS_DIR -p 8090 >> $LOGFILE 2>&1" || {
+                log_msg "ERROR: start-stop-daemon could not launch TorrServer"
+                rm -f "$PIDFILE"
+                return 1
+            }
 
-        echo $! > "$PIDFILE"
         sleep 2
 
         if ! valid_pid "$(cat "$PIDFILE" 2>/dev/null)"; then
@@ -619,56 +647,52 @@ start() {
     if [ ! -f "$WDPID" ] || ! valid_pid "$(cat "$WDPID" 2>/dev/null)"; then
         rm -f "$WDPID"
 
-        (
-            RESTARTS=0
-            STABLE_TIME=0
+        # Launch watchdog using start-stop-daemon, just like the old script.
+        start-stop-daemon -S -b -m \
+            -p "$WDPID" \
+            -x /bin/sh -- -c "
+                RESTARTS=0
+                STABLE_TIME=0
+                while :; do
+                    sleep 10
+                    [ -f \"$WDPID\" ] || exit 0
+                    PID=\$(cat \"$PIDFILE\" 2>/dev/null)
 
-            while :; do
-                sleep 10
+                    if [ -z \"\$PID\" ] || ! kill -0 \"\$PID\" 2>/dev/null; then
+                        log_msg \"CRASH: Process died (restart \$RESTARTS/10)\"
+                        rm -f \"$PIDFILE\"
+                        RESTARTS=\$((RESTARTS + 1))
+                        STABLE_TIME=0
 
-                # Removing the watchdog PID file is the stop request.
-                [ -f "$WDPID" ] || exit 0
+                        if [ \"\$RESTARTS\" -gt 10 ]; then
+                            log_msg \"ERROR: Restart limit reached. Giving up.\"
+                            rm -f \"$WDPID\"
+                            exit 1
+                        fi
 
-                PID="$(cat "$PIDFILE" 2>/dev/null)"
+                        if [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE")" -gt 524288 ]; then
+                            mv "$LOGFILE" "$LOGFILE.old"
+                        fi
 
-                if ! valid_pid "$PID"; then
-                    rm -f "$PIDFILE"
-                    RESTARTS=$((RESTARTS + 1))
-                    STABLE_TIME=0
-
-                    log_msg "CRASH: Process died (restart $RESTARTS/10)"
-
-                    if [ "$RESTARTS" -gt 10 ]; then
-                        log_msg "ERROR: Restart limit reached. Giving up."
-                        rm -f "$WDPID"
-                        exit 1
-                    fi
-
-                    rotate_log
-
-                    (
-                        export GOMAXPROCS=1
-                        export GOGC=20
-                        exec "$BIN" -d "$TS_DIR" -p 8090
-                    ) >> "$LOGFILE" 2>&1 &
-
-                    echo $! > "$PIDFILE"
-                else
-                    if [ "$RESTARTS" -gt 0 ]; then
-                        STABLE_TIME=$((STABLE_TIME + 10))
-
-                        if [ "$STABLE_TIME" -ge 300 ]; then
-                            RESTARTS=0
-                            STABLE_TIME=0
-                            log_msg "INFO: Process stable for 5min; restart counter reset"
+                        start-stop-daemon -S -b -m \\
+                            -p \"$PIDFILE\" \\
+                            -x /bin/sh -- -c \"export GOMAXPROCS=1; export GOGC=20; exec $BIN -d $TS_DIR -p 8090 >> $LOGFILE 2>&1\"
+                    else
+                        if [ \"\$RESTARTS\" -gt 0 ]; then
+                            STABLE_TIME=\$((STABLE_TIME + 10))
+                            if [ \"\$STABLE_TIME\" -ge 300 ]; then
+                                RESTARTS=0
+                                STABLE_TIME=0
+                                log_msg \"INFO: Process stable for 5min; restart counter reset\"
+                            fi
                         fi
                     fi
-                fi
-            done
-        ) >/dev/null 2>&1 &
-
-        # The parent writes the watchdog PID so it is available immediately.
-        echo $! > "$WDPID"
+                done
+            " || {
+                log_msg "ERROR: start-stop-daemon could not launch watchdog"
+                rm -f "$WDPID"
+                return 1
+            }
     fi
 
     return 0
