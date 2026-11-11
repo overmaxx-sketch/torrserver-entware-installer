@@ -1002,6 +1002,33 @@ fi
     exit 1
 }
 
+# Validate the selected tag using POSIX shell patterns (no jq regex support needed).
+case "$TARGET_TAG" in
+    MatriX.*) ;;
+    *)
+        log "ERROR: Selected release tag has an unexpected format: $TARGET_TAG"
+        exit 1
+        ;;
+esac
+case "$TARGET_TAG" in
+    *[!A-Za-z0-9._-]*|*..*|*/*)
+        log "ERROR: Selected release tag contains unsafe characters: $TARGET_TAG"
+        exit 1
+        ;;
+esac
+
+# Confirm the selected release advertises the expected architecture-specific binary.
+if ! jq -e --arg tag "$TARGET_TAG" --arg asset "$TARGET" '
+    [ .[]
+      | select(.tag_name == $tag)
+      | .assets[]?
+      | select(.name == $asset)
+    ] | length > 0
+' "$TMP_JSON" >/dev/null 2>&1; then
+    log "ERROR: Release $TARGET_TAG does not contain the expected asset $TARGET"
+    exit 1
+fi
+
 log "Selected version: $TARGET_TAG"
 
 if [ "$TARGET_TAG" = "$CURRENT_TAG" ]; then
