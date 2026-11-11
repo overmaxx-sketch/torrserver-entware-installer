@@ -2,7 +2,8 @@
 # TorrServer updater for ASUSWRT-Merlin / Entware
 # Repository: overmaxx-sketch/torrserver-unblock-bylampa
 
-export PATH="/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+PATH="/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:${PATH:-/usr/bin:/bin}"
+export PATH
 
 REPO="overmaxx-sketch/torrserver-unblock-bylampa"
 
@@ -73,17 +74,40 @@ log() {
     echo "$MSG" >> "$UPDATELOG"
 }
 
+# Search PATH directly instead of relying on `which` or `command -v`.
+# Entware programs normally live in /opt/bin and /opt/sbin on Merlin.
+tool_available() {
+    TOOL_TO_FIND="$1"
+
+    # kill is provided by the POSIX shell itself on ASUSWRT/Merlin.
+    case "$TOOL_TO_FIND" in
+        kill) return 0 ;;
+    esac
+
+    OLD_IFS="$IFS"
+    IFS=:
+    for TOOL_DIR in $PATH; do
+        [ -n "$TOOL_DIR" ] || TOOL_DIR="."
+        if [ -f "$TOOL_DIR/$TOOL_TO_FIND" ] && [ -x "$TOOL_DIR/$TOOL_TO_FIND" ]; then
+            IFS="$OLD_IFS"
+            return 0
+        fi
+    done
+    IFS="$OLD_IFS"
+    return 1
+}
+
 check_dependencies() {
     REQUIRED_TOOLS="
         wget grep cut head sed df tail awk
         cp chmod mkdir rm rmdir cat date sleep
-        kill mv wc sync env sh which start-stop-daemon tr
+        kill mv wc sync env sh start-stop-daemon tr
     "
 
     MISSING_TOOLS=""
 
     for TOOL in $REQUIRED_TOOLS; do
-        if ! which "$TOOL" >/dev/null 2>&1; then
+        if ! tool_available "$TOOL"; then
             MISSING_TOOLS="$MISSING_TOOLS $TOOL"
         fi
     done
@@ -106,6 +130,8 @@ check_dependencies() {
 }
 
 cleanup() {
+    rm -f "$TS_DIR/.settings.json.tmp.$$" \
+        "${TS_BIN}.new.$$" "${INIT}.new.$$" 2>/dev/null
     rm -rf "$WORKDIR"
     rmdir "$LOCKDIR" 2>/dev/null
 }
@@ -277,6 +303,7 @@ ensure_dns() {
             return 0
         fi
         chmod 644 "$SETTINGS" 2>/dev/null || true
+        SETTINGS_CHANGED=1
         log "Initial settings.json created with Dns=127.0.0.1 and BitTorr.StoreSettingsInJson=true"
         return 0
     fi
@@ -302,7 +329,8 @@ ensure_dns() {
         return 0
     fi
 
-    TMP_SETTINGS="$WORKDIR/settings.json"
+    # Keep the temporary file on the same filesystem as settings.json so mv is atomic.
+    TMP_SETTINGS="$TS_DIR/.settings.json.tmp.$$"
 
     if grep -Eq '"Dns"[[:space:]]*:' "$SETTINGS"; then
         # Update the existing Dns value.
@@ -363,11 +391,17 @@ ensure_dns() {
         return 1
     fi
 
-    if ! cp "$TMP_SETTINGS" "$SETTINGS"; then
-        log "ERROR: Failed to save updated settings.json"
+    if ! chmod 600 "$TMP_SETTINGS" 2>/dev/null; then
+        log "WARNING: Could not set temporary settings permissions"
+    fi
+
+    if ! mv -f "$TMP_SETTINGS" "$SETTINGS"; then
+        rm -f "$TMP_SETTINGS"
+        log "ERROR: Failed to atomically save updated settings.json"
         return 1
     fi
 
+    SETTINGS_CHANGED=1
     log "DNS successfully set to 127.0.0.1"
     return 0
 }
@@ -542,7 +576,8 @@ create_init_script() {
     cat > "$INIT_CANDIDATE" <<'INITEOT'
 #!/bin/sh
 
-export PATH="/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+PATH="/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:${PATH:-/usr/bin:/bin}"
+export PATH
 
 BIN="/opt/sbin/torrserver"
 TS_DIR="/opt/etc/torrserver"
@@ -1150,7 +1185,6 @@ if [ -f "$SETTINGS" ]; then
 fi
 
 log "Checking DNS settings"
-SETTINGS_CHANGED=1
 if ! ensure_dns; then
     rollback
     exit 1
@@ -1166,40 +1200,64 @@ fi
 
 log "Installing candidate binary"
 
-if ! cp "$CANDIDATE" "$TS_BIN"; then
-    log "ERROR: Failed to install the new binary"
+# Stage the binary beside the destination, then rename atomically on /opt.
+BIN_STAGE="${TS_BIN}.new.$$"
+if ! cp "$CANDIDATE" "$BIN_STAGE"; then
+    log "ERROR: Failed to stage the new binary"
+    rm -f "$BIN_STAGE"
     rollback
     exit 1
 fi
 
-chmod 755 "$TS_BIN" || {
-    log "ERROR: Failed to set binary permissions"
+if ! chmod 755 "$BIN_STAGE"; then
+    log "ERROR: Failed to set staged binary permissions"
+    rm -f "$BIN_STAGE"
     rollback
     exit 1
-}
+fi
 
-if ! env GOMAXPROCS=1 GOGC=20 "$TS_BIN" --version; then
-    log "ERROR: Installed binary failed the version test"
+if ! env GOMAXPROCS=1 GOGC=20 "$BIN_STAGE" --version; then
+    log "ERROR: Staged binary failed the version test"
+    rm -f "$BIN_STAGE"
+    rollback
+    exit 1
+fi
+
+if ! mv -f "$BIN_STAGE" "$TS_BIN"; then
+    log "ERROR: Failed to atomically install the new binary"
+    rm -f "$BIN_STAGE"
     rollback
     exit 1
 fi
 
 log "Installing new init script"
 
-if ! cp "$INIT_CANDIDATE" "$INIT"; then
-    log "ERROR: Failed to install the new init script"
+# The init script is staged in the destination directory for an atomic rename.
+INIT_STAGE="${INIT}.new.$$"
+if ! cp "$INIT_CANDIDATE" "$INIT_STAGE"; then
+    log "ERROR: Failed to stage the new init script"
+    rm -f "$INIT_STAGE"
     rollback
     exit 1
 fi
 
-chmod 755 "$INIT" || {
-    log "ERROR: Failed to set init script permissions"
+if ! chmod 755 "$INIT_STAGE"; then
+    log "ERROR: Failed to set staged init-script permissions"
+    rm -f "$INIT_STAGE"
     rollback
     exit 1
-}
+fi
 
-if ! sh -n "$INIT"; then
-    log "ERROR: Installed init script failed syntax validation"
+if ! sh -n "$INIT_STAGE"; then
+    log "ERROR: Staged init script failed syntax validation"
+    rm -f "$INIT_STAGE"
+    rollback
+    exit 1
+fi
+
+if ! mv -f "$INIT_STAGE" "$INIT"; then
+    log "ERROR: Failed to atomically install the new init script"
+    rm -f "$INIT_STAGE"
     rollback
     exit 1
 fi
@@ -1207,24 +1265,32 @@ fi
 sync
 
 ###############################################
-# Start TorrServer after every successful installation/update
+# Restore the intended service state
 ###############################################
 
-log "Starting TorrServer after installation/update, regardless of its previous state"
+if [ "$WAS_RUNNING" -eq 1 ] || [ "$HAD_COMPLETE_INSTALL" -eq 0 ]; then
+    if [ "$WAS_RUNNING" -eq 1 ]; then
+        log "Service was running before update; starting updated service"
+    else
+        log "Fresh or incomplete installation; starting TorrServer"
+    fi
 
-if ! start_service; then
-    log "ERROR: Updated service failed to start"
-    rollback
-    exit 1
+    if ! start_service; then
+        log "ERROR: Updated service failed to start"
+        rollback
+        exit 1
+    fi
+
+    if ! verify_service_ready; then
+        log "ERROR: Post-install service health checks failed"
+        rollback
+        exit 1
+    fi
+
+    log "TorrServer, watchdog and HTTP readiness checks passed"
+else
+    log "Service was stopped before update; leaving it stopped"
 fi
-
-if ! verify_service_ready; then
-    log "ERROR: Post-install service health checks failed"
-    rollback
-    exit 1
-fi
-
-log "TorrServer, watchdog and HTTP readiness checks passed"
 
 INSTALL_STARTED=0
 log "Update completed successfully: $TARGET_TAG"
