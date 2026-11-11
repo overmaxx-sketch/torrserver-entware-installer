@@ -2,6 +2,9 @@
 # TorrServer updater for ASUSWRT-Merlin / Entware
 # Repository: overmaxx-sketch/torrserver-unblock-bylampa
 
+# Avoid world-writable files created by this script.
+umask 022
+
 PATH="/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:${PATH:-/usr/bin:/bin}"
 export PATH
 
@@ -54,10 +57,12 @@ BIN_BACKUP="$TS_DIR/torrserver.backup"
 INIT_BACKUP="$INIT.backup"
 
 LOCKDIR="/tmp/torrserver-updater.lock"
-WORKDIR="/tmp/torrserver-update.$$"
-CANDIDATE="$WORKDIR/torrserver.new"
-INIT_CANDIDATE="$WORKDIR/S90torrserver.new"
-TMP_JSON="$WORKDIR/releases.json"
+WORKDIR=""
+CANDIDATE=""
+INIT_CANDIDATE=""
+TMP_JSON=""
+AUTO_CHOICE="${AUTO_CHOICE:-}"
+AUTO_REINSTALL="${AUTO_REINSTALL:-N}"
 
 WAS_RUNNING=0
 HAD_COMPLETE_INSTALL=0
@@ -99,7 +104,7 @@ tool_available() {
 
 check_dependencies() {
     REQUIRED_TOOLS="
-        wget grep cut head sed df tail awk
+        wget jq grep cut head sed df tail awk
         cp chmod mkdir rm rmdir cat date sleep
         kill mv wc sync env sh start-stop-daemon tr
     "
@@ -132,7 +137,9 @@ check_dependencies() {
 cleanup() {
     rm -f "$TS_DIR/.settings.json.tmp.$$" \
         "${TS_BIN}.new.$$" "${INIT}.new.$$" 2>/dev/null
-    rm -rf "$WORKDIR"
+    if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
+        rm -rf "$WORKDIR"
+    fi
     rmdir "$LOCKDIR" 2>/dev/null
 }
 
@@ -294,17 +301,40 @@ verify_service_ready() {
 ###############################################
 
 ensure_dns() {
-    # Fresh installation: create a minimal settings file if none exists.
+    TMP_SETTINGS="$TS_DIR/.settings.json.tmp.$$"
+
+    # Fresh installation: create settings.json with jq and install it atomically.
     if [ ! -f "$SETTINGS" ]; then
         log "settings.json does not exist; no backup is needed"
-        log "Attempting to create an initial configuration"
-        if ! printf '{\n  "Dns": "127.0.0.1",\n  "BitTorr": {\n    "StoreSettingsInJson": true\n  }\n}\n' > "$SETTINGS"; then
-            log "WARNING: Could not create settings.json: $SETTINGS; continuing installation without it"
-            return 0
+        log "Creating initial configuration with jq"
+
+        if ! printf '{}' | jq '.Dns = "127.0.0.1" | .BitTorr.StoreSettingsInJson = true' > "$TMP_SETTINGS"; then
+            rm -f "$TMP_SETTINGS"
+            log "ERROR: jq could not create the initial settings.json"
+            return 1
         fi
-        chmod 644 "$SETTINGS" 2>/dev/null || true
+
+        if ! jq -e 'type == "object" and .Dns == "127.0.0.1" and .BitTorr.StoreSettingsInJson == true' \
+            "$TMP_SETTINGS" >/dev/null 2>&1; then
+            rm -f "$TMP_SETTINGS"
+            log "ERROR: Initial settings.json failed JSON validation"
+            return 1
+        fi
+
+        if ! chmod 600 "$TMP_SETTINGS"; then
+            rm -f "$TMP_SETTINGS"
+            log "ERROR: Could not set permissions on initial settings.json"
+            return 1
+        fi
+
+        if ! mv -f "$TMP_SETTINGS" "$SETTINGS"; then
+            rm -f "$TMP_SETTINGS"
+            log "ERROR: Could not install initial settings.json"
+            return 1
+        fi
+
         SETTINGS_CHANGED=1
-        log "Initial settings.json created with Dns=127.0.0.1 and BitTorr.StoreSettingsInJson=true"
+        log "Initial settings.json created and validated with jq"
         return 0
     fi
 
@@ -316,7 +346,6 @@ ensure_dns() {
         if cp -p "$SETTINGS" "$DNS_BACKUP"; then
             log "Settings backup saved: $DNS_BACKUP"
         else
-            # Do not modify user settings unless a recoverable backup exists.
             log "ERROR: Could not back up settings.json; refusing to change it"
             return 1
         fi
@@ -324,75 +353,34 @@ ensure_dns() {
         log "Settings backup already exists; leaving it unchanged"
     fi
 
-    if grep -Eq '"Dns"[[:space:]]*:[[:space:]]*"127\.0\.0\.1"' "$SETTINGS"; then
+    # jq is mandatory, so validate the JSON before inspecting or modifying it.
+    if ! jq -e 'type == "object"' "$SETTINGS" >/dev/null 2>&1; then
+        log "ERROR: settings.json is not a valid JSON object; refusing to modify it"
+        return 1
+    fi
+
+    if jq -e '.Dns == "127.0.0.1"' "$SETTINGS" >/dev/null 2>&1; then
         log "DNS is already set to 127.0.0.1"
         return 0
     fi
 
-    # Keep the temporary file on the same filesystem as settings.json so mv is atomic.
-    TMP_SETTINGS="$TS_DIR/.settings.json.tmp.$$"
-
-    if grep -Eq '"Dns"[[:space:]]*:' "$SETTINGS"; then
-        # Update the existing Dns value.
-        sed 's/"Dns"[[:space:]]*:[[:space:]]*"[^"]*"/"Dns": "127.0.0.1"/' \
-            "$SETTINGS" > "$TMP_SETTINGS" || {
-                log "ERROR: Failed to update Dns setting"
-                return 1
-            }
-    else
-        log "Dns key is missing; adding it to settings.json"
-
-        # Insert the new root-level key immediately after the first opening brace.
-        # Handle an empty object separately to avoid a trailing comma.
-        if grep -Eq '^[[:space:]]*\{[[:space:]]*\}[[:space:]]*$' "$SETTINGS"; then
-            awk '
-                /^[[:space:]]*\{[[:space:]]*\}[[:space:]]*$/ {
-                    sub(/\{[[:space:]]*\}/, "{\n  \"Dns\": \"127.0.0.1\"\n}")
-                }
-                { print }
-            ' "$SETTINGS" > "$TMP_SETTINGS" || {
-                log "ERROR: Could not add Dns to empty JSON object"
-                return 1
-            }
-        else
-            awk '
-                BEGIN { inserted=0 }
-                {
-                    line=$0
-
-                    if (!inserted && match(line, /\{/)) {
-                        prefix=substr(line, 1, RSTART)
-                        rest=substr(line, RSTART+1)
-
-                        print prefix
-                        print "  \"Dns\": \"127.0.0.1\","
-
-                        if (rest != "") {
-                            print rest
-                        }
-
-                        inserted=1
-                    } else {
-                        print line
-                    }
-                }
-                END {
-                    if (!inserted) exit 2
-                }
-            ' "$SETTINGS" > "$TMP_SETTINGS" || {
-                log "ERROR: Could not safely add Dns to settings.json"
-                return 1
-            }
-        fi
-    fi
-
-    if ! grep -Eq '"Dns"[[:space:]]*:[[:space:]]*"127\.0\.0\.1"' "$TMP_SETTINGS"; then
-        log "ERROR: DNS verification failed in temporary settings"
+    if ! jq '.Dns = "127.0.0.1"' "$SETTINGS" > "$TMP_SETTINGS"; then
+        rm -f "$TMP_SETTINGS"
+        log "ERROR: jq failed to update Dns setting"
         return 1
     fi
 
-    if ! chmod 600 "$TMP_SETTINGS" 2>/dev/null; then
-        log "WARNING: Could not set temporary settings permissions"
+    if ! jq -e 'type == "object" and .Dns == "127.0.0.1"' \
+        "$TMP_SETTINGS" >/dev/null 2>&1; then
+        rm -f "$TMP_SETTINGS"
+        log "ERROR: JSON verification failed after updating Dns"
+        return 1
+    fi
+
+    if ! chmod 600 "$TMP_SETTINGS"; then
+        rm -f "$TMP_SETTINGS"
+        log "ERROR: Could not set permissions on updated settings.json"
+        return 1
     fi
 
     if ! mv -f "$TMP_SETTINGS" "$SETTINGS"; then
@@ -402,7 +390,7 @@ ensure_dns() {
     fi
 
     SETTINGS_CHANGED=1
-    log "DNS successfully set to 127.0.0.1"
+    log "DNS successfully set to 127.0.0.1 (validated with jq)"
     return 0
 }
 
@@ -859,10 +847,22 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
     exit 1
 fi
 
-mkdir -p "$WORKDIR" || {
-    rmdir "$LOCKDIR" 2>/dev/null
-    exit 1
-}
+# Use an unpredictable temporary directory where supported. BusyBox/Entware
+# installations without a compatible mktemp fall back to a PID-based name.
+if tool_available mktemp; then
+    WORKDIR="$(mktemp -d /tmp/torrserver-update.XXXXXX 2>/dev/null)"
+fi
+if [ -z "$WORKDIR" ] || [ ! -d "$WORKDIR" ]; then
+    WORKDIR="/tmp/torrserver-update.$$"
+    if ! (umask 077 && mkdir "$WORKDIR"); then
+        log "ERROR: Cannot create temporary working directory"
+        rmdir "$LOCKDIR" 2>/dev/null
+        exit 1
+    fi
+fi
+CANDIDATE="$WORKDIR/torrserver.new"
+INIT_CANDIDATE="$WORKDIR/S90torrserver.new"
+TMP_JSON="$WORKDIR/releases.json"
 
 trap on_signal HUP INT TERM
 trap on_exit EXIT
@@ -919,9 +919,11 @@ if [ ! -s "$TMP_JSON" ]; then
     exit 1
 fi
 
-ALL_TAGS="$(grep '"tag_name"' "$TMP_JSON" |
-    cut -d '"' -f 4 |
-    grep '^MatriX\.')"
+if ! jq -e 'type == "array"' "$TMP_JSON" >/dev/null 2>&1; then
+    log "ERROR: GitHub response is not a valid releases JSON array"
+    exit 1
+fi
+ALL_TAGS="$(jq -r '.[].tag_name | select(type == "string" and startswith("MatriX."))' "$TMP_JSON")"
 
 if [ -z "$ALL_TAGS" ]; then
     log "ERROR: No MatriX.* releases found"
@@ -944,11 +946,20 @@ done
 echo "$i) Exit without installing"
 EXIT_CHOICE="$i"
 
-while :; do
-    printf "Enter choice (1-%s): " "$EXIT_CHOICE"
-    read CHOICE
+if [ -n "$AUTO_CHOICE" ]; then
+    CHOICE="$AUTO_CHOICE"
+    log "Using AUTO_CHOICE=$CHOICE"
+else
+    CHOICE=""
+    while :; do
+        printf "Enter choice (1-%s): " "$EXIT_CHOICE"
+        if ! IFS= read -r CHOICE; then
+            echo
+            log "Input closed; exiting without installing TorrServer"
+            exit 0
+        fi
 
-    case "$CHOICE" in
+        case "$CHOICE" in
         ''|*[!0-9]*)
             echo "Please enter a number between 1 and $EXIT_CHOICE."
             continue
@@ -959,8 +970,20 @@ while :; do
         break
     fi
 
-    echo "Invalid choice."
-done
+        echo "Invalid choice."
+    done
+fi
+
+case "$CHOICE" in
+    ''|*[!0-9]*)
+        log "ERROR: AUTO_CHOICE must be a number between 1 and $EXIT_CHOICE"
+        exit 1
+        ;;
+esac
+if [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "$EXIT_CHOICE" ]; then
+    log "ERROR: Choice is outside the valid range 1-$EXIT_CHOICE"
+    exit 1
+fi
 
 if [ "$CHOICE" -eq "$EXIT_CHOICE" ]; then
     log "Exiting without installing TorrServer"
@@ -982,11 +1005,20 @@ fi
 log "Selected version: $TARGET_TAG"
 
 if [ "$TARGET_TAG" = "$CURRENT_TAG" ]; then
-    printf "Version %s is already installed. Reinstall? (y/N): " "$TARGET_TAG"
-    read REINSTALL
+    if [ -n "$AUTO_CHOICE" ]; then
+        REINSTALL="$AUTO_REINSTALL"
+        log "Using AUTO_REINSTALL=$REINSTALL"
+    else
+        printf "Version %s is already installed. Reinstall? (y/N): " "$TARGET_TAG"
+        if ! IFS= read -r REINSTALL; then
+            echo
+            log "Input closed; installation cancelled"
+            exit 0
+        fi
+    fi
 
     case "$REINSTALL" in
-        y|Y|yes|YES) ;;
+        y|Y|yes|YES|1) ;;
         *) log "Installation cancelled"; exit 0 ;;
     esac
 fi
