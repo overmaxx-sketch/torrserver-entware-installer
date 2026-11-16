@@ -102,32 +102,77 @@ tool_available() {
     return 1
 }
 
-check_dependencies() {
-    REQUIRED_TOOLS="
-        wget jq grep cut head sed df tail awk
-        cp chmod mkdir rm rmdir cat date sleep
-        kill mv wc sync env sh start-stop-daemon tr
-    "
+suggest_install_command() {
+    TOOL_TO_INSTALL="$1"
 
+    case "$TOOL_TO_INSTALL" in
+        jq)
+            echo "  opkg update && opkg install jq"
+            ;;
+        patchelf)
+            echo "  opkg update && opkg install patchelf"
+            ;;
+        readelf)
+            echo "  opkg update && opkg install binutils"
+            ;;
+        wget)
+            echo "  opkg update && opkg install wget-ssl"
+            ;;
+        start-stop-daemon)
+            echo "  opkg update && opkg install busybox"
+            echo "  Check applet availability: /opt/bin/busybox --list | grep -x start-stop-daemon"
+            echo "  Create the symlink only if the applet is listed:"
+            echo "  ln -sf /opt/bin/busybox /opt/bin/start-stop-daemon"
+            ;;
+        sort)
+            echo "  opkg update && opkg install coreutils-sort"
+            ;;
+        grep)
+            echo "  opkg update && opkg install grep"
+            ;;
+        sed)
+            echo "  opkg update && opkg install sed"
+            ;;
+        awk)
+            echo "  opkg update && opkg install gawk"
+            ;;
+        *)
+            echo "  Check the router's BusyBox applets or install the corresponding Entware package."
+            ;;
+    esac
+}
+
+check_dependencies() {
+    # ASUSWRT-Merlin provides the standard shell/BusyBox utilities used here.
+    # Check separately only dependencies that are not safe to assume present.
+    REQUIRED_TOOLS="wget jq patchelf readelf start-stop-daemon"
     MISSING_TOOLS=""
 
     for TOOL in $REQUIRED_TOOLS; do
-        if ! tool_available "$TOOL"; then
+        # patchelf is invoked by its absolute path below, so check that exact file.
+        if [ "$TOOL" = "patchelf" ]; then
+            if [ ! -x /opt/bin/patchelf ]; then
+                MISSING_TOOLS="$MISSING_TOOLS $TOOL"
+            fi
+        elif ! tool_available "$TOOL"; then
             MISSING_TOOLS="$MISSING_TOOLS $TOOL"
         fi
     done
 
     if [ -n "$MISSING_TOOLS" ]; then
         log "ERROR: Required commands are missing:"
-        log "$MISSING_TOOLS"
-        log "Install the missing utilities before running the updater."
+        for TOOL in $MISSING_TOOLS; do
+            log "  - $TOOL"
+            suggest_install_command "$TOOL"
+        done
+        log "Install the missing utilities, then run the updater again."
         return 1
     fi
 
-    if [ -x /opt/bin/patchelf ]; then
-        log "Optional dependency found: /opt/bin/patchelf"
+    if tool_available mktemp; then
+        log "Optional dependency found: mktemp (secure random temporary directory)"
     else
-        log "WARNING: patchelf is not installed; ELF interpreter will not be modified"
+        log "WARNING: mktemp is unavailable; updater will use its protected PID-based fallback directory"
     fi
 
     log "Dependency check passed"
@@ -637,7 +682,26 @@ get_uptime() {
 
         SECONDS_UP=$((NOW - START / HZ))
         [ "$SECONDS_UP" -lt 0 ] && SECONDS_UP=0
-        echo "$((SECONDS_UP / 60))m $((SECONDS_UP % 60))s"
+
+        YEARS=$((SECONDS_UP / 31536000))
+        REMAINDER=$((SECONDS_UP % 31536000))
+        MONTHS=$((REMAINDER / 2592000))
+        REMAINDER=$((REMAINDER % 2592000))
+        DAYS=$((REMAINDER / 86400))
+        REMAINDER=$((REMAINDER % 86400))
+        HOURS=$((REMAINDER / 3600))
+        REMAINDER=$((REMAINDER % 3600))
+        MINUTES=$((REMAINDER / 60))
+        SECONDS=$((REMAINDER % 60))
+
+        UPTIME_TEXT=""
+        [ "$YEARS" -gt 0 ] && UPTIME_TEXT="${UPTIME_TEXT}${YEARS}y "
+        [ "$MONTHS" -gt 0 ] && UPTIME_TEXT="${UPTIME_TEXT}${MONTHS}mo "
+        [ "$DAYS" -gt 0 ] && UPTIME_TEXT="${UPTIME_TEXT}${DAYS}d "
+        [ "$HOURS" -gt 0 ] && UPTIME_TEXT="${UPTIME_TEXT}${HOURS}h "
+        [ "$MINUTES" -gt 0 ] && UPTIME_TEXT="${UPTIME_TEXT}${MINUTES}m "
+        UPTIME_TEXT="${UPTIME_TEXT}${SECONDS}s"
+        echo "$UPTIME_TEXT"
     else
         echo "unknown"
     fi
@@ -906,9 +970,49 @@ fi
 # Get releases
 ###############################################
 
+###############################################
+# Tag helpers: numeric core of a MatriX tag
+###############################################
+
+# Fork releases may carry suffixes (for example "MatriX.147.1-bylampa").
+# These helpers extract the numeric core for sorting and comparison,
+# keeping the original tag intact for download URLs.
+
+tag_core() {
+    awk '{
+        core = substr($0, 8)
+        out = ""
+        for (i = 1; i <= length(core); i++) {
+            ch = substr(core, i, 1)
+            if (ch == "." || (ch >= "0" && ch <= "9")) out = out ch
+            else break
+        }
+        sub(/\.$/, "", out)
+        print out
+    }'
+}
+
+tag_sort_key() {
+    awk '{
+        core = substr($0, 8)
+        out = ""
+        for (i = 1; i <= length(core); i++) {
+            ch = substr(core, i, 1)
+            if (ch == "." || (ch >= "0" && ch <= "9")) out = out ch
+            else break
+        }
+        sub(/\.$/, "", out)
+        n = split(out, c, ".")
+        key = ""
+        for (i = 1; i <= 4; i++)
+            key = key sprintf("%06d", c[i] + 0) " "
+        print key $0
+    }'
+}
+
 log "Fetching release list from GitHub"
 
-if ! wget --no-hsts --timeout=15 --tries=2 -qO "$TMP_JSON" \
+if ! wget -T 15 -t 2 -qO "$TMP_JSON" \
     "https://api.github.com/repos/$REPO/releases?per_page=30"; then
     log "ERROR: Could not fetch release list"
     exit 1
@@ -923,15 +1027,33 @@ if ! jq -e 'type == "array"' "$TMP_JSON" >/dev/null 2>&1; then
     log "ERROR: GitHub response is not a valid releases JSON array"
     exit 1
 fi
-ALL_TAGS="$(jq -r '.[].tag_name | select(type == "string" and startswith("MatriX."))' "$TMP_JSON")"
+# Sort tags numerically by their dotted version components instead of trusting
+# the order returned by the GitHub API (e.g. MatriX.147.10 > MatriX.147.2).
+# Only accept version tags made of numeric components after the MatriX prefix.
+RAW_TAGS="$(jq -r '.[]?.tag_name // empty' "$TMP_JSON" \
+    | grep -E '^MatriX\.[0-9][0-9.]*' | sort -u)"
 
-if [ -z "$ALL_TAGS" ]; then
-    log "ERROR: No MatriX.* releases found"
+if [ -z "$RAW_TAGS" ]; then
+    log "ERROR: No valid MatriX numeric-version releases found"
     exit 1
 fi
 
-LATEST_TAG="$(echo "$ALL_TAGS" | head -n 1)"
-LAST_TAGS="$(echo "$ALL_TAGS" | sed '1d' | head -n 5)"
+# Keep the original tag for download URLs; sort by the numeric core so
+# MatriX.147.10 sorts after MatriX.147.2 and fork suffixes (e.g.
+# MatriX.147.1-bylampa) do not break the order. No jq regex needed,
+# because some Entware jq builds do not include Oniguruma.
+ALL_TAGS="$(printf '%s\n' "$RAW_TAGS" \
+    | tag_sort_key \
+    | sort -nr \
+    | cut -d' ' -f5-)"
+
+if [ -z "$ALL_TAGS" ]; then
+    log "ERROR: No valid MatriX numeric-version releases found"
+    exit 1
+fi
+
+LATEST_TAG="$(printf '%s\n' "$ALL_TAGS" | head -n 1)"
+LAST_TAGS="$(printf '%s\n' "$ALL_TAGS" | sed '1d' | head -n 5)"
 
 echo
 echo "===== Select TorrServer version to install ====="
@@ -960,15 +1082,15 @@ else
         fi
 
         case "$CHOICE" in
-        ''|*[!0-9]*)
-            echo "Please enter a number between 1 and $EXIT_CHOICE."
-            continue
-            ;;
-    esac
+            ''|*[!0-9]*)
+                echo "Please enter a number between 1 and $EXIT_CHOICE."
+                continue
+                ;;
+        esac
 
-    if [ "$CHOICE" -ge 1 ] && [ "$CHOICE" -le "$EXIT_CHOICE" ]; then
-        break
-    fi
+        if [ "$CHOICE" -ge 1 ] && [ "$CHOICE" -le "$EXIT_CHOICE" ]; then
+            break
+        fi
 
         echo "Invalid choice."
     done
@@ -1002,22 +1124,15 @@ fi
     exit 1
 }
 
-# Validate the selected tag using POSIX shell patterns (no jq regex support needed).
-case "$TARGET_TAG" in
-    MatriX.*) ;;
-    *)
-        log "ERROR: Selected release tag has an unexpected format: $TARGET_TAG"
-        exit 1
-        ;;
-esac
-case "$TARGET_TAG" in
-    *[!A-Za-z0-9._-]*|*..*|*/*)
-        log "ERROR: Selected release tag contains unsafe characters: $TARGET_TAG"
-        exit 1
-        ;;
-esac
+# Validate the selected tag before interpolating it into a download URL, and
+# verify that this release actually publishes the binary for this architecture.
+TARGET_CORE="$(printf '%s\n' "$TARGET_TAG" | tag_core)"
 
-# Confirm the selected release advertises the expected architecture-specific binary.
+if [ -z "$TARGET_CORE" ]; then
+    log "ERROR: Selected release tag has an unexpected format: $TARGET_TAG"
+    exit 1
+fi
+
 if ! jq -e --arg tag "$TARGET_TAG" --arg asset "$TARGET" '
     [ .[]
       | select(.tag_name == $tag)
@@ -1031,7 +1146,9 @@ fi
 
 log "Selected version: $TARGET_TAG"
 
-if [ "$TARGET_TAG" = "$CURRENT_TAG" ]; then
+TARGET_CORE="$(printf '%s\n' "$TARGET_TAG" | tag_core)"
+CURRENT_CORE="$(printf '%s\n' "$CURRENT_TAG" | tag_core)"
+if [ -n "$CURRENT_CORE" ] && [ "$TARGET_CORE" = "$CURRENT_CORE" ]; then
     if [ -n "$AUTO_CHOICE" ]; then
         REINSTALL="$AUTO_REINSTALL"
         log "Using AUTO_REINSTALL=$REINSTALL"
@@ -1071,7 +1188,7 @@ esac
 BIN_URL="https://github.com/$REPO/releases/download/$TARGET_TAG/$TARGET"
 log "Downloading $TARGET_TAG to temporary storage"
 
-if ! wget --no-hsts --timeout=30 --tries=2 -O "$CANDIDATE" "$BIN_URL"; then
+if ! wget -T 30 -t 2 -O "$CANDIDATE" "$BIN_URL"; then
     log "ERROR: Download failed"
     exit 1
 fi
@@ -1091,100 +1208,187 @@ chmod 755 "$CANDIDATE" || {
     exit 1
 }
 
-# Detect and repair the ELF interpreter only when necessary.
-if [ -x /opt/bin/patchelf ]; then
-    ELF_INTERPRETER="$(/opt/bin/patchelf --print-interpreter \
-        "$CANDIDATE" 2>/dev/null)"
-    PATCHELF_RC=$?
+# Inspect the ELF interpreter using both patchelf and readelf. readelf is a required
+# dependency and acts as the authoritative fallback when patchelf cannot print .interp.
+# A binary with no PT_INTERP is tested unchanged; a dynamic binary is tested with its
+# original loader first, then with explicit same-family Entware loader candidates.
+readelf_interpreter() {
+    RI_OUTPUT="$(readelf -l "$1" 2>/dev/null)" || return 1
+    RI_PATH="$(printf '%s\n' "$RI_OUTPUT" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p' | sed -n '1p')"
+    [ -n "$RI_PATH" ] || return 2
+    printf '%s\n' "$RI_PATH"
+    return 0
+}
 
-    if [ "$PATCHELF_RC" -ne 0 ] || [ -z "$ELF_INTERPRETER" ]; then
-        log "No patchable ELF interpreter detected; testing binary as-is"
-    elif [ -e "$ELF_INTERPRETER" ]; then
-        log "ELF interpreter exists: $ELF_INTERPRETER"
+ELF_INTERPRETER="$(/opt/bin/patchelf --print-interpreter "$CANDIDATE" 2>/dev/null)"
+PATCHELF_RC=$?
+READELF_OUTPUT="$(readelf -l "$CANDIDATE" 2>/dev/null)"
+READELF_RC=$?
+READELF_INTERPRETER=""
+if [ "$READELF_RC" -eq 0 ]; then
+    READELF_INTERPRETER="$(printf '%s\n' "$READELF_OUTPUT" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p' | sed -n '1p')"
+fi
+
+if [ "$PATCHELF_RC" -ne 0 ] || [ -z "$ELF_INTERPRETER" ]; then
+    if [ -n "$READELF_INTERPRETER" ]; then
+        ELF_INTERPRETER="$READELF_INTERPRETER"
+        log "patchelf could not read the interpreter; readelf identified PT_INTERP: $ELF_INTERPRETER"
+        log "Continuing loader compatibility checks using the readelf result"
+    elif [ "$READELF_RC" -eq 0 ] && ! printf '%s\n' "$READELF_OUTPUT" | grep -q 'INTERP'; then
+        log "readelf found no PT_INTERP segment; candidate appears static, so patchelf is not needed"
+        if ! env GOMAXPROCS=1 GOGC=20 "$CANDIDATE" --version; then
+            log "ERROR: Candidate failed --version despite having no PT_INTERP segment"
+            exit 1
+        fi
+        log "Candidate passed --version without changing its ELF interpreter"
+    elif [ "$READELF_RC" -eq 0 ]; then
+        log "ERROR: readelf reports PT_INTERP but could not extract the requested interpreter path"
+        log "Cannot safely choose a compatible Entware loader; refusing to install this candidate"
+        exit 1
     else
-        log "Required ELF interpreter is missing: $ELF_INTERPRETER"
+        log "ERROR: patchelf could not read the interpreter and readelf could not inspect ELF program headers"
+        log "Cannot safely determine whether this binary needs an interpreter; refusing to install it"
+        exit 1
+    fi
+fi
+
+if [ -n "$ELF_INTERPRETER" ]; then
+    log "Binary ELF interpreter: $ELF_INTERPRETER"
+    ORIGINAL_CANDIDATE="$WORKDIR/candidate.original"
+    if ! cp -p "$CANDIDATE" "$ORIGINAL_CANDIDATE"; then
+        log "ERROR: Cannot save an unmodified copy of the candidate binary"
+        exit 1
+    fi
+
+    ORIGINAL_RUNS=0
+    if [ -e "$ELF_INTERPRETER" ]; then
+        log "Original ELF interpreter exists; testing candidate with it first"
+    else
+        log "Original ELF interpreter is missing; testing candidate before attempting repair"
+    fi
+
+    if env GOMAXPROCS=1 GOGC=20 "$CANDIDATE" --version; then
+        ORIGINAL_RUNS=1
+        log "Candidate runs with its original ELF interpreter"
+    else
+        log "Candidate failed with its original ELF interpreter; will try a matching Entware loader if identifiable"
+    fi
+
+    ENTWARE_LOADERS=""
+    LOADER_FAMILY=""
+    case "$ELF_INTERPRETER" in
+        *ld-musl*)
+            LOADER_FAMILY="musl"
+            case "$ARCH" in
+                arm64) ENTWARE_LOADERS="/opt/lib/ld-musl-aarch64.so.1" ;;
+                arm7)  ENTWARE_LOADERS="/opt/lib/ld-musl-armhf.so.1 /opt/lib/ld-musl-arm.so.1" ;;
+                arm6|arm5) ENTWARE_LOADERS="/opt/lib/ld-musl-arm.so.1" ;;
+                amd64) ENTWARE_LOADERS="/opt/lib/ld-musl-x86_64.so.1" ;;
+                386)   ENTWARE_LOADERS="/opt/lib/ld-musl-i386.so.1" ;;
+                mips|mipsle) ENTWARE_LOADERS="/opt/lib/ld-musl-mips*.so.1" ;;
+                mips64|mips64le) ENTWARE_LOADERS="/opt/lib/ld-musl-mips64*.so.1" ;;
+            esac
+            ;;
+        *ld-uClibc*)
+            LOADER_FAMILY="uClibc"
+            ENTWARE_LOADERS="/opt/lib/ld-uClibc.so.0"
+            ;;
+        *ld-linux*)
+            LOADER_FAMILY="glibc"
+            case "$ARCH" in
+                arm64) ENTWARE_LOADERS="/opt/lib/ld-linux-aarch64.so.1" ;;
+                arm7)  ENTWARE_LOADERS="/opt/lib/ld-linux-armhf.so.3 /opt/lib/ld-linux.so.3" ;;
+                arm6|arm5) ENTWARE_LOADERS="/opt/lib/ld-linux.so.3 /opt/lib/ld-linux-armhf.so.3" ;;
+                amd64) ENTWARE_LOADERS="/opt/lib/ld-linux-x86-64.so.2" ;;
+                386)   ENTWARE_LOADERS="/opt/lib/ld-linux.so.2" ;;
+                # Do not guess a MIPS glibc loader from its filename alone.
+                mips|mipsle|mips64|mips64le) ENTWARE_LOADERS="" ;;
+            esac
+            ;;
+        */ld.so.1|*/ld.so|*/ld-*.so*)
+            LOADER_FAMILY="ambiguous"
+            ;;
+        *)
+            LOADER_FAMILY="unknown"
+            ;;
+    esac
+
+    if [ "$LOADER_FAMILY" = "ambiguous" ] || [ "$LOADER_FAMILY" = "unknown" ]; then
+        if [ "$ORIGINAL_RUNS" -eq 1 ]; then
+            log "Interpreter family is ambiguous ($ELF_INTERPRETER); keeping the working original loader"
+        else
+            log "ERROR: Cannot safely identify a compatible Entware loader for $ELF_INTERPRETER"
+            log "Candidate failed with its original loader; refusing to guess a replacement"
+            exit 1
+        fi
+    elif [ -n "$ENTWARE_LOADERS" ]; then
+        ENTWARE_RUNS=0
         ENTWARE_INTERPRETER=""
 
-        case "$ARCH" in
-            arm64)
-                for LOADER in \
-                    /opt/lib/ld-linux-aarch64.so.1
-                do
-                    if [ -e "$LOADER" ]; then
-                        ENTWARE_INTERPRETER="$LOADER"
-                        break
-                    fi
-                done
-                ;;
-            arm7|arm6|arm5)
-                for LOADER in \
-                    /opt/lib/ld-linux.so.3 \
-                    /opt/lib/ld-linux-armhf.so.3
-                do
-                    if [ -e "$LOADER" ]; then
-                        ENTWARE_INTERPRETER="$LOADER"
-                        break
-                    fi
-                done
-                ;;
-            amd64)
-                for LOADER in \
-                    /opt/lib/ld-linux-x86-64.so.2
-                do
-                    if [ -e "$LOADER" ]; then
-                        ENTWARE_INTERPRETER="$LOADER"
-                        break
-                    fi
-                done
-                ;;
-            386)
-                for LOADER in \
-                    /opt/lib/ld-linux.so.2
-                do
-                    if [ -e "$LOADER" ]; then
-                        ENTWARE_INTERPRETER="$LOADER"
-                        break
-                    fi
-                done
-                ;;
-            mips|mipsle|mips64|mips64le)
-                for LOADER in \
-                    /opt/lib/ld.so.1 \
-                    /opt/lib/ld-uClibc.so.0 \
-                    /opt/lib/ld-musl-mips*.so.1
-                do
-                    if [ -e "$LOADER" ]; then
-                        ENTWARE_INTERPRETER="$LOADER"
-                        break
-                    fi
-                done
-                ;;
-            *)
-                log "No interpreter mapping for architecture: $ARCH"
-                ;;
-        esac
+        # Restore the exact original candidate before every attempt. Verify the new
+        # interpreter with readelf as well as patchelf, so verification does not depend
+        # solely on patchelf being able to print .interp.
+        for LOADER_PATTERN in $ENTWARE_LOADERS; do
+            for LOADER in $LOADER_PATTERN; do
+                [ -x "$LOADER" ] || continue
+                [ "$LOADER" = "$ELF_INTERPRETER" ] && continue
 
-        if [ -n "$ENTWARE_INTERPRETER" ]; then
-            log "Trying Entware interpreter: $ENTWARE_INTERPRETER"
+                if ! cp -p "$ORIGINAL_CANDIDATE" "$CANDIDATE"; then
+                    log "ERROR: Could not restore candidate before loader test"
+                    exit 1
+                fi
 
-            if ! /opt/bin/patchelf \
-                --set-interpreter "$ENTWARE_INTERPRETER" "$CANDIDATE"
-            then
-                log "ERROR: Failed to set ELF interpreter"
+                log "Trying Entware $LOADER_FAMILY loader: $LOADER"
+                if ! /opt/bin/patchelf --set-interpreter "$LOADER" "$CANDIDATE"; then
+                    log "WARNING: patchelf could not set interpreter to $LOADER"
+                    continue
+                fi
+
+                VERIFIED_INTERPRETER="$(/opt/bin/patchelf --print-interpreter "$CANDIDATE" 2>/dev/null)"
+                if [ "$VERIFIED_INTERPRETER" != "$LOADER" ]; then
+                    VERIFIED_INTERPRETER="$(readelf_interpreter "$CANDIDATE")"
+                fi
+                if [ "$VERIFIED_INTERPRETER" != "$LOADER" ]; then
+                    log "WARNING: Interpreter verification failed for $LOADER (reported: ${VERIFIED_INTERPRETER:-none})"
+                    continue
+                fi
+                log "Verified PT_INTERP with readelf/patchelf: $VERIFIED_INTERPRETER"
+
+                if env GOMAXPROCS=1 GOGC=20 "$CANDIDATE" --version; then
+                    ENTWARE_RUNS=1
+                    ENTWARE_INTERPRETER="$LOADER"
+                    break 2
+                fi
+                log "WARNING: Candidate failed --version with $LOADER"
+            done
+        done
+
+        if [ "$ENTWARE_RUNS" -eq 1 ]; then
+            log "Candidate passed --version with Entware loader: $ENTWARE_INTERPRETER"
+        else
+            if [ ! -e "$ELF_INTERPRETER" ] || [ "$ORIGINAL_RUNS" -ne 1 ]; then
+                log "ERROR: No candidate passed --version with a compatible Entware loader"
                 exit 1
             fi
+            if ! cp -p "$ORIGINAL_CANDIDATE" "$CANDIDATE"; then
+                log "ERROR: Could not restore original candidate after failed Entware loader tests"
+                exit 1
+            fi
+            log "No Entware loader passed; restored the original candidate, which passed its initial --version test"
+        fi
+    else
+        if [ "$ORIGINAL_RUNS" -eq 1 ]; then
+            log "No explicit Entware loader mapping for this architecture/family; keeping the working original loader"
         else
-            log "ERROR: No candidate Entware interpreter found"
+            log "ERROR: No Entware loader mapping for $LOADER_FAMILY on architecture $ARCH"
             exit 1
         fi
     fi
-else
-    log "WARNING: patchelf is unavailable; testing binary without changes"
 fi
 
-log "Testing candidate binary"
+log "Final candidate binary validation"
 if ! env GOMAXPROCS=1 GOGC=20 "$CANDIDATE" --version; then
-    log "ERROR: Candidate binary failed the --version test"
+    log "ERROR: Candidate binary failed the final --version test"
     exit 1
 fi
 
