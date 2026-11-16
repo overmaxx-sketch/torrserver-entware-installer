@@ -1210,8 +1210,12 @@ chmod 755 "$CANDIDATE" || {
 
 # Inspect the ELF interpreter using both patchelf and readelf. readelf is a required
 # dependency and acts as the authoritative fallback when patchelf cannot print .interp.
-# A binary with no PT_INTERP is tested unchanged; a dynamic binary is tested with its
-# original loader first, then with explicit same-family Entware loader candidates.
+# A binary with no PT_INTERP is tested unchanged. For a dynamic binary, first record
+# whether the original interpreter works, then ALWAYS try compatible same-family
+# Entware loaders when mappings are known. A working Entware loader is preferred;
+# the original interpreter is a fallback only if no Entware candidate passes --version.
+# Passing --version is a launch-compatibility check, not proof that a loader is newer
+# or universally better; the later service/HTTP checks remain necessary.
 readelf_interpreter() {
     RI_OUTPUT="$(readelf -l "$1" 2>/dev/null)" || return 1
     RI_PATH="$(printf '%s\n' "$RI_OUTPUT" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p' | sed -n '1p')"
@@ -1365,16 +1369,20 @@ if [ -n "$ELF_INTERPRETER" ]; then
 
         if [ "$ENTWARE_RUNS" -eq 1 ]; then
             log "Candidate passed --version with Entware loader: $ENTWARE_INTERPRETER"
-        else
-            if [ ! -e "$ELF_INTERPRETER" ] || [ "$ORIGINAL_RUNS" -ne 1 ]; then
-                log "ERROR: No candidate passed --version with a compatible Entware loader"
-                exit 1
-            fi
+            log "Selected Entware loader in preference to the original interpreter"
+        elif [ "$ORIGINAL_RUNS" -eq 1 ]; then
+            # The original candidate already passed its launch test. If every
+            # compatible Entware loader failed, preserve the known-working original
+            # binary instead of making the update fail solely due to the experiment.
             if ! cp -p "$ORIGINAL_CANDIDATE" "$CANDIDATE"; then
                 log "ERROR: Could not restore original candidate after failed Entware loader tests"
                 exit 1
             fi
-            log "No Entware loader passed; restored the original candidate, which passed its initial --version test"
+            log "No Entware loader passed --version; restored the original candidate, which passed its initial --version test"
+        else
+            log "ERROR: Neither the original interpreter nor any compatible Entware loader passed --version"
+            log "Refusing to install this candidate"
+            exit 1
         fi
     else
         if [ "$ORIGINAL_RUNS" -eq 1 ]; then
