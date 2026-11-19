@@ -149,12 +149,7 @@ check_dependencies() {
     MISSING_TOOLS=""
 
     for TOOL in $REQUIRED_TOOLS; do
-        # patchelf is invoked by its absolute path below, so check that exact file.
-        if [ "$TOOL" = "patchelf" ]; then
-            if [ ! -x /opt/bin/patchelf ]; then
-                MISSING_TOOLS="$MISSING_TOOLS $TOOL"
-            fi
-        elif ! tool_available "$TOOL"; then
+        if ! tool_available "$TOOL"; then
             MISSING_TOOLS="$MISSING_TOOLS $TOOL"
         fi
     done
